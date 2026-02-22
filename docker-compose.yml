@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  logging-service:
+    build: ./logging-service
+    container_name: logging-service
+    ports:
+      - "8001:8001"
+
+  messages-service:
+    build: ./messages-service
+    container_name: messages-service
+    ports:
+      - "8002:8002"
+
+  facade-service:
+    build: ./facade-service
+    container_name: facade-service
+    environment:
+      - LOGGING_URL=http://logging-service:8001
+      - MESSAGES_URL=http://messages-service:8002
+      - RETRY_COUNT=5
+      - RETRY_BASE_DELAY=0.3
+      - TIMEOUT_SEC=1.0
+    ports:
+      - "8000:8000"
+    depends_on:
+      - logging-service
+      - messages-service
