@@ -1,0 +1,50 @@
+services:
+  hz1:
+    image: hazelcast/hazelcast:5.3.6
+    container_name: hz1
+    hostname: hz1
+    environment:
+      JAVA_OPTS: -Dhazelcast.config=/opt/hazelcast/config_ext/hazelcast.yaml
+    volumes:
+      - ./config/hazelcast.yaml:/opt/hazelcast/config_ext/hazelcast.yaml:ro
+    ports:
+      - "5701:5701"
+
+  hz2:
+    image: hazelcast/hazelcast:5.3.6
+    container_name: hz2
+    hostname: hz2
+    environment:
+      JAVA_OPTS: -Dhazelcast.config=/opt/hazelcast/config_ext/hazelcast.yaml
+    volumes:
+      - ./config/hazelcast.yaml:/opt/hazelcast/config_ext/hazelcast.yaml:ro
+    ports:
+      - "5702:5701"
+    depends_on:
+      - hz1
+
+  hz3:
+    image: hazelcast/hazelcast:5.3.6
+    container_name: hz3
+    hostname: hz3
+    environment:
+      JAVA_OPTS: -Dhazelcast.config=/opt/hazelcast/config_ext/hazelcast.yaml
+    volumes:
+      - ./config/hazelcast.yaml:/opt/hazelcast/config_ext/hazelcast.yaml:ro
+    ports:
+      - "5703:5701"
+    depends_on:
+      - hz1
+
+  management-center:
+    image: hazelcast/management-center:5.3.4
+    container_name: hazelcast-mc
+    ports:
+      - "8080:8080"
+    environment:
+      MC_DEFAULT_CLUSTER: apz-hz
+      MC_DEFAULT_CLUSTER_MEMBERS: hz1:5701,hz2:5701,hz3:5701
+    depends_on:
+      - hz1
+      - hz2
+      - hz3

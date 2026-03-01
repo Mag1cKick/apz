@@ -1,0 +1,23 @@
+hazelcast:
+  cluster-name: apz-hz
+
+  network:
+    join:
+      multicast:
+        enabled: false
+      tcp-ip:
+        enabled: true
+        member-list:
+          - hz1:5701
+          - hz2:5701
+          - hz3:5701
+
+  map:
+    demo-map:
+      backup-count: 2
+    counter-map:
+      backup-count: 2
+
+  queue:
+    bounded-queue:
+      max-size: 10
