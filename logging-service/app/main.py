@@ -1,15 +1,47 @@
 from __future__ import annotations
 
+import os
 import uuid as uuid_lib
-from typing import Dict, List
 
+import hazelcast
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="logging-service", version="1.0.0")
+app = FastAPI(title="logging-service", version="2.0.0")
 
-STORE: Dict[str, str] = {}
+HZ_CLUSTER_MEMBERS = os.getenv(
+    "HZ_CLUSTER_MEMBERS",
+    "hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701"
+)
+MAP_NAME = "messages"
+
+hz_client: hazelcast.HazelcastClient = None
+store = None
+
+
+@app.on_event("startup")
+def startup():
+    global hz_client, store
+    members = HZ_CLUSTER_MEMBERS.split(",")
+    hz_client = hazelcast.HazelcastClient(
+        cluster_members=members,
+        cluster_name="dev",
+        reconnect_mode=hazelcast.config.ReconnectMode.ASYNC,
+        connection_timeout=5.0,
+        retry_initial_backoff=1.0,
+        retry_max_backoff=10.0,
+        retry_multiplier=1.5,
+        cluster_connect_timeout=30.0,
+    )
+    store = hz_client.get_map(MAP_NAME).blocking()
+    print(f"[HZ] Connected to cluster members: {members}")
+
+
+@app.on_event("shutdown")
+def shutdown():
+    if hz_client:
+        hz_client.shutdown()
 
 
 class LogIn(BaseModel):
@@ -25,7 +57,7 @@ class LogOut(BaseModel):
 
 @app.get("/health", tags=["system"])
 def health():
-    return {"status": "ok", "count": len(STORE)}
+    return {"status": "ok", "count": store.size() if store else 0}
 
 
 @app.post("/log", response_model=LogOut, tags=["logs"])
@@ -35,18 +67,24 @@ def add_log(payload: LogIn):
     except Exception as e:
         raise HTTPException(status_code=400, detail="Invalid UUID in field 'id'") from e
 
-    if payload.id in STORE:
-        print(f"[DEDUP] duplicate id={payload.id} msg='{payload.msg}'")
-        return LogOut(id=payload.id, stored=False, msg=STORE[payload.id])
-
-    STORE[payload.id] = payload.msg
-    print(f"[STORE] id={payload.id} msg='{payload.msg}'")
-    return LogOut(id=payload.id, stored=True, msg=payload.msg)
+    try:
+        existing = store.get(payload.id)
+        if existing is not None:
+            print(f"[DEDUP] duplicate id={payload.id} msg='{payload.msg}'")
+            return LogOut(id=payload.id, stored=False, msg=existing)
+        store.put(payload.id, payload.msg)
+        print(f"[STORE] id={payload.id} msg='{payload.msg}'")
+        return LogOut(id=payload.id, stored=True, msg=payload.msg)
+    except Exception as e:
+        print(f"[HZ ERROR] {e}")
+        raise HTTPException(status_code=503, detail=f"Hazelcast unavailable: {e}")
 
 
 @app.get("/logs", tags=["logs"], response_class=PlainTextResponse)
-def get_logs(format: str = "text"):
-    msgs: List[str] = list(STORE.values())
-    if format == "json":
-        return {"messages": msgs}
-    return ", ".join(msgs)
+def get_logs():
+    try:
+        msgs = list(store.values())
+        return ", ".join(msgs)
+    except Exception as e:
+        print(f"[HZ ERROR] {e}")
+        raise HTTPException(status_code=503, detail=f"Hazelcast unavailable: {e}")

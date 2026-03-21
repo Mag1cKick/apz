@@ -1,29 +1,108 @@
 version: "3.9"
 
 services:
-  logging-service:
+
+  hazelcast-1:
+    image: hazelcast/hazelcast:5.3
+    container_name: hazelcast-1
+    environment:
+      - HZ_CLUSTERNAME=dev
+    ports:
+      - "5701:5701"
+
+  hazelcast-2:
+    image: hazelcast/hazelcast:5.3
+    container_name: hazelcast-2
+    environment:
+      - HZ_CLUSTERNAME=dev
+    ports:
+      - "5702:5701"
+
+  hazelcast-3:
+    image: hazelcast/hazelcast:5.3
+    container_name: hazelcast-3
+    environment:
+      - HZ_CLUSTERNAME=dev
+    ports:
+      - "5703:5701"
+
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: counterdb
+    ports:
+      - "3307:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  logging-service-1:
     build: ./logging-service
-    container_name: logging-service
+    container_name: logging-service-1
+    environment:
+      - HZ_CLUSTER_MEMBERS=hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
     ports:
       - "8001:8001"
+    depends_on:
+      - hazelcast-1
+      - hazelcast-2
+      - hazelcast-3
 
-  messages-service:
-    build: ./messages-service
-    container_name: messages-service
+  logging-service-2:
+    build: ./logging-service
+    container_name: logging-service-2
+    environment:
+      - HZ_CLUSTER_MEMBERS=hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
+    ports:
+      - "8011:8001"
+    depends_on:
+      - hazelcast-1
+      - hazelcast-2
+      - hazelcast-3
+
+  logging-service-3:
+    build: ./logging-service
+    container_name: logging-service-3
+    environment:
+      - HZ_CLUSTER_MEMBERS=hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
+    ports:
+      - "8021:8001"
+    depends_on:
+      - hazelcast-1
+      - hazelcast-2
+      - hazelcast-3
+
+  counter-service:
+    build: ./counter-service
+    container_name: counter-service
+    environment:
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_USER=root
+      - DB_PASS=root
+      - DB_NAME=counterdb
     ports:
       - "8002:8002"
+    depends_on:
+      mysql:
+        condition: service_healthy
 
   facade-service:
     build: ./facade-service
     container_name: facade-service
     environment:
-      - LOGGING_URL=http://logging-service:8001
-      - MESSAGES_URL=http://messages-service:8002
-      - RETRY_COUNT=5
+      - LOGGING_URLS=http://logging-service-1:8001,http://logging-service-2:8001,http://logging-service-3:8001
+      - COUNTER_URL=http://counter-service:8002
+      - TIMEOUT_SEC=2.0
       - RETRY_BASE_DELAY=0.3
-      - TIMEOUT_SEC=1.0
     ports:
       - "8000:8000"
     depends_on:
-      - logging-service
-      - messages-service
+      - logging-service-1
+      - logging-service-2
+      - logging-service-3
+      - counter-service

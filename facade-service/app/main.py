@@ -2,22 +2,27 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import uuid
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="facade-service", version="1.0.0")
+app = FastAPI(title="facade-service", version="2.0.0")
 
-LOGGING_URL = os.getenv("LOGGING_URL", "http://logging-service:8001")
-MESSAGES_URL = os.getenv("MESSAGES_URL", "http://messages-service:8002")
+# Comma-separated list of logging-service URLs
+_raw = os.getenv(
+    "LOGGING_URLS",
+    "http://logging-service-1:8001,http://logging-service-2:8001,http://logging-service-3:8001"
+)
+LOGGING_URLS: List[str] = [u.strip() for u in _raw.split(",")]
 
-RETRY_COUNT = int(os.getenv("RETRY_COUNT", "5"))
+COUNTER_URL = os.getenv("COUNTER_URL", "http://counter-service:8002")
+TIMEOUT_SEC = float(os.getenv("TIMEOUT_SEC", "2.0"))
 RETRY_BASE_DELAY = float(os.getenv("RETRY_BASE_DELAY", "0.3"))
-TIMEOUT_SEC = float(os.getenv("TIMEOUT_SEC", "1.0"))
 
 
 class ClientPostIn(BaseModel):
@@ -28,103 +33,70 @@ class ClientPostOut(BaseModel):
     id: str
     msg: str
     logging_status: str
-    attempts: int
+    used_url: str
 
 
 @app.get("/health", tags=["system"])
 def health():
-    return {
-        "status": "ok",
-        "logging_url": LOGGING_URL,
-        "messages_url": MESSAGES_URL,
-        "retry_count": RETRY_COUNT,
-        "timeout_sec": TIMEOUT_SEC,
-    }
+    return {"status": "ok", "logging_urls": LOGGING_URLS, "counter_url": COUNTER_URL}
 
 
-async def post_with_retry(
-    url: str,
-    json_payload: dict,
-    *,
-    attempts: int,
-    base_delay: float,
-    timeout_sec: float,
-    fail_first_n: int = 0,
-) -> Tuple[bool, int, Optional[str]]:
-    last_error: Optional[str] = None
+async def post_to_logging(msg_id: str, msg: str) -> Tuple[bool, str, Optional[str]]:
+    """Try each logging-service instance in random order until one succeeds."""
+    urls = LOGGING_URLS.copy()
+    random.shuffle(urls)
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_sec)) as client:
-        for i in range(1, attempts + 1):
-            if fail_first_n > 0:
-                fail_first_n -= 1
-                last_error = "forced failure (test hook)"
-                print(f"[RETRY] attempt={i}/{attempts} -> {last_error}")
-            else:
-                try:
-                    resp = await client.post(url, json=json_payload)
-                    resp.raise_for_status()
-                    return True, i, None
-                except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
-                    last_error = f"{type(e).__name__}: {e}"
-                    print(f"[RETRY] attempt={i}/{attempts} -> {last_error}")
-                except httpx.HTTPStatusError as e:
-                    last_error = f"HTTPStatusError: {e.response.status_code} {e.response.text}"
-                    return False, i, last_error
+    async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT_SEC)) as client:
+        for url in urls:
+            try:
+                resp = await client.post(f"{url}/log", json={"id": msg_id, "msg": msg})
+                resp.raise_for_status()
+                print(f"[POST] Delivered to {url} id={msg_id}")
+                return True, url, None
+            except Exception as e:
+                print(f"[POST] {url} failed: {e}, trying next...")
 
-            if i < attempts:
-                delay = base_delay * (2 ** (i - 1))
-                await asyncio.sleep(delay)
+    return False, "", "All logging-service instances unavailable"
 
-    return False, attempts, last_error
+
+async def get_from_logging() -> Tuple[bool, str, Optional[str]]:
+    """Try each logging-service instance in random order until one succeeds."""
+    urls = LOGGING_URLS.copy()
+    random.shuffle(urls)
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT_SEC)) as client:
+        for url in urls:
+            try:
+                resp = await client.get(f"{url}/logs")
+                resp.raise_for_status()
+                print(f"[GET] Read from {url}")
+                return True, resp.text, None
+            except Exception as e:
+                print(f"[GET] {url} failed: {e}, trying next...")
+
+    return False, "", "All logging-service instances unavailable"
 
 
 @app.post("/message", response_model=ClientPostOut, tags=["client"])
-async def client_post_message(
-    payload: ClientPostIn,
-    fail_first_n: int = Query(0, ge=0, le=10, description="Test hook: force first N attempts to fail before real request"),
-):
+async def client_post_message(payload: ClientPostIn):
     msg_id = str(uuid.uuid4())
-
-    ok, used, err = await post_with_retry(
-        f"{LOGGING_URL}/log",
-        {"id": msg_id, "msg": payload.msg},
-        attempts=RETRY_COUNT,
-        base_delay=RETRY_BASE_DELAY,
-        timeout_sec=TIMEOUT_SEC,
-        fail_first_n=fail_first_n,
-    )
-
+    ok, used_url, err = await post_to_logging(msg_id, payload.msg)
     if not ok:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "error": "Failed to deliver message to logging-service",
-                "attempts": used,
-                "last_error": err,
-            },
-        )
-
-    return ClientPostOut(
-        id=msg_id,
-        msg=payload.msg,
-        logging_status="delivered",
-        attempts=used,
-    )
+        raise HTTPException(status_code=502, detail=err)
+    return ClientPostOut(id=msg_id, msg=payload.msg, logging_status="delivered", used_url=used_url)
 
 
 @app.get("/messages", tags=["client"], response_class=PlainTextResponse)
 async def client_get_messages():
     async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT_SEC)) as client:
         try:
-            ms = await client.get(f"{MESSAGES_URL}/message")
-            ms.raise_for_status()
+            cs = await client.get(f"{COUNTER_URL}/message")
+            cs.raise_for_status()
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"messages-service unavailable: {e}")
+            raise HTTPException(status_code=502, detail=f"counter-service unavailable: {e}")
 
-        try:
-            lg = await client.get(f"{LOGGING_URL}/logs")
-            lg.raise_for_status()
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"logging-service unavailable: {e}")
+    ok, logs_text, err = await get_from_logging()
+    if not ok:
+        raise HTTPException(status_code=502, detail=err)
 
-    return f"{ms.text}\n{lg.text}"
+    return f"{cs.text}\n{logs_text}"
