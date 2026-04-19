@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import os
+import time
 import uuid as uuid_lib
 
 import hazelcast
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="logging-service", version="2.0.0")
+app = FastAPI(title="logging-service", version="3.0.0")
 
 HZ_CLUSTER_MEMBERS = os.getenv(
     "HZ_CLUSTER_MEMBERS",
-    "hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701"
+    "hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701",
 )
+CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://config-server:8010")
+SELF_URL = os.getenv("SELF_URL", "http://logging-service:8001")
 MAP_NAME = "messages"
 
 hz_client: hazelcast.HazelcastClient = None
@@ -36,6 +40,19 @@ def startup():
     )
     store = hz_client.get_map(MAP_NAME).blocking()
     print(f"[HZ] Connected to cluster members: {members}")
+
+    for attempt in range(10):
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                client.post(
+                    f"{CONFIG_SERVER_URL}/register",
+                    json={"name": "logging-service", "url": SELF_URL},
+                )
+            print(f"[CONFIG] Registered logging-service -> {SELF_URL}")
+            break
+        except Exception as e:
+            print(f"[CONFIG] Registration attempt {attempt + 1} failed: {e}")
+            time.sleep(2)
 
 
 @app.on_event("shutdown")
