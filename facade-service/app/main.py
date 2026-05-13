@@ -4,28 +4,31 @@ import asyncio
 import json
 import os
 import random
+import time
 import uuid
 from typing import List, Optional, Tuple
 
+import consul
 import hazelcast
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="facade-service", version="3.0.0")
+app = FastAPI(title="facade-service", version="4.0.0")
 
-CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://config-server:8010")
-SELF_URL = os.getenv("SELF_URL", "http://facade-service:8000")
-HZ_CLUSTER_MEMBERS = os.getenv(
-    "HZ_CLUSTER_MEMBERS",
-    "hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701",
-)
-QUEUE_NAME = "counter-queue"
+CONSUL_HOST = os.getenv("CONSUL_HOST", "consul")
+CONSUL_PORT = int(os.getenv("CONSUL_PORT", "8500"))
+SERVICE_ID = os.getenv("SERVICE_ID", "facade-service-1")
+SERVICE_NAME = "facade-service"
+SERVICE_ADDRESS = os.getenv("SERVICE_ADDRESS", "facade-service")
+SERVICE_PORT = int(os.getenv("SERVICE_PORT", "8000"))
 TIMEOUT_SEC = float(os.getenv("TIMEOUT_SEC", "2.0"))
 
+consul_client: Optional[consul.Consul] = None
 hz_client: Optional[hazelcast.HazelcastClient] = None
 counter_queue = None
+_queue_name: str = "counter-queue"
 
 
 class ClientPostIn(BaseModel):
@@ -39,10 +42,46 @@ class ClientPostOut(BaseModel):
     used_url: str
 
 
+def _kv_get(key: str, default: str = "") -> str:
+    for attempt in range(10):
+        try:
+            _, data = consul_client.kv.get(key)
+            if data and data.get("Value"):
+                return data["Value"].decode()
+        except Exception as e:
+            print(f"[CONSUL] KV '{key}' attempt {attempt + 1}: {e}")
+        time.sleep(2)
+    print(f"[CONSUL] KV '{key}' not found, using default: '{default}'")
+    return default
+
+
+def _discover(service_name: str) -> List[str]:
+    try:
+        _, services = consul_client.health.service(service_name, passing=True)
+        urls = [
+            f"http://{s['Service']['Address']}:{s['Service']['Port']}"
+            for s in services
+        ]
+        return urls
+    except Exception as e:
+        print(f"[CONSUL] Discovery '{service_name}' error: {e}")
+        return []
+
+
 @app.on_event("startup")
 async def startup():
-    global hz_client, counter_queue
-    members = HZ_CLUSTER_MEMBERS.split(",")
+    global consul_client, hz_client, counter_queue, _queue_name
+
+    consul_client = consul.Consul(host=CONSUL_HOST, port=CONSUL_PORT)
+
+    hz_members_str = _kv_get(
+        "hazelcast/cluster-members",
+        "hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701",
+    )
+    _queue_name = _kv_get("mq/queue-name", "counter-queue")
+    print(f"[CONSUL] HZ members: {hz_members_str}  queue: {_queue_name}")
+
+    members = hz_members_str.split(",")
     hz_client = hazelcast.HazelcastClient(
         cluster_members=members,
         cluster_name="dev",
@@ -53,41 +92,46 @@ async def startup():
         retry_multiplier=1.5,
         cluster_connect_timeout=30.0,
     )
-    counter_queue = hz_client.get_queue(QUEUE_NAME).blocking()
-    print(f"[HZ] Connected; queue '{QUEUE_NAME}' ready")
+    counter_queue = hz_client.get_queue(_queue_name).blocking()
+    print(f"[HZ] Connected; queue '{_queue_name}' ready")
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
-        for attempt in range(10):
-            try:
-                await client.post(
-                    f"{CONFIG_SERVER_URL}/register",
-                    json={"name": "facade-service", "url": SELF_URL},
-                )
-                print(f"[CONFIG] Registered facade-service -> {SELF_URL}")
-                break
-            except Exception as e:
-                print(f"[CONFIG] Registration attempt {attempt + 1} failed: {e}")
-                await asyncio.sleep(2)
+    try:
+        consul_client.agent.service.register(
+            name=SERVICE_NAME,
+            service_id=SERVICE_ID,
+            address=SERVICE_ADDRESS,
+            port=SERVICE_PORT,
+            check=consul.Check.http(
+                f"http://{SERVICE_ADDRESS}:{SERVICE_PORT}/health",
+                interval="10s",
+                timeout="5s",
+                deregister="30s",
+            ),
+        )
+        print(f"[CONSUL] Registered {SERVICE_ID} @ {SERVICE_ADDRESS}:{SERVICE_PORT}")
+    except Exception as e:
+        print(f"[CONSUL] Registration failed: {e}")
 
 
 @app.on_event("shutdown")
 def shutdown():
+    try:
+        consul_client.agent.service.deregister(SERVICE_ID)
+        print(f"[CONSUL] Deregistered {SERVICE_ID}")
+    except Exception:
+        pass
     if hz_client:
         hz_client.shutdown()
 
 
 async def _get_service_urls(name: str) -> List[str]:
-    async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT_SEC)) as client:
-        for attempt in range(5):
-            try:
-                resp = await client.get(f"{CONFIG_SERVER_URL}/services/{name}")
-                if resp.status_code == 200:
-                    urls = resp.json()
-                    if urls:
-                        return urls
-            except Exception as e:
-                print(f"[CONFIG] Lookup '{name}' attempt {attempt + 1}: {e}")
-            await asyncio.sleep(1)
+    loop = asyncio.get_event_loop()
+    for attempt in range(5):
+        urls = await loop.run_in_executor(None, _discover, name)
+        if urls:
+            return urls
+        print(f"[CONSUL] No healthy '{name}' instances, retry {attempt + 1}")
+        await asyncio.sleep(1)
     return []
 
 
@@ -116,7 +160,7 @@ async def _get_from_logging(urls: List[str]) -> Tuple[bool, str, Optional[str]]:
             try:
                 resp = await client.get(f"{url}/logs")
                 resp.raise_for_status()
-                print(f"[GET] Read logs from {url}")
+                print(f"[GET] Logs from {url}")
                 return True, resp.text, None
             except Exception as e:
                 print(f"[GET] {url} failed: {e}")
@@ -124,24 +168,22 @@ async def _get_from_logging(urls: List[str]) -> Tuple[bool, str, Optional[str]]:
 
 
 @app.get("/health", tags=["system"])
-async def health():
-    return {"status": "ok", "config_server": CONFIG_SERVER_URL}
+def health():
+    return {"status": "ok"}
 
 
 @app.post("/message", response_model=ClientPostOut, tags=["client"])
 async def client_post_message(payload: ClientPostIn):
     msg_id = str(uuid.uuid4())
 
-    # Push to Hazelcast Queue asynchronously — counter-service will consume
     item = json.dumps({"id": msg_id, "msg": payload.msg})
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, counter_queue.offer, item)
     print(f"[MQ] Enqueued id={msg_id} msg='{payload.msg}'")
 
-    # Forward to one logging-service instance
     logging_urls = await _get_service_urls("logging-service")
     if not logging_urls:
-        raise HTTPException(status_code=503, detail="No logging-service instances registered")
+        raise HTTPException(status_code=503, detail="No logging-service instances available")
     ok, used_url, err = await _post_to_logging(msg_id, payload.msg, logging_urls)
     if not ok:
         raise HTTPException(status_code=502, detail=err)
@@ -151,7 +193,6 @@ async def client_post_message(payload: ClientPostIn):
 
 @app.get("/messages", tags=["client"], response_class=PlainTextResponse)
 async def client_get_messages():
-    # Read from counter-service via HTTP GET (unchanged path)
     counter_text = "null"
     counter_urls = await _get_service_urls("counter-service")
     if counter_urls:
@@ -163,14 +204,12 @@ async def client_get_messages():
                 counter_text = cs.text
             except Exception as e:
                 print(f"[GET] counter-service unavailable: {e}")
-                counter_text = "null"
     else:
-        print("[GET] No counter-service registered in config-server")
+        print("[GET] No counter-service instances in Consul")
 
-    # Read logs from logging-service
     logging_urls = await _get_service_urls("logging-service")
     if not logging_urls:
-        raise HTTPException(status_code=503, detail="No logging-service instances registered")
+        raise HTTPException(status_code=503, detail="No logging-service instances available")
     ok, logs_text, err = await _get_from_logging(logging_urls)
     if not ok:
         raise HTTPException(status_code=502, detail=err)

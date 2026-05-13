@@ -4,30 +4,53 @@ import os
 import time
 import uuid as uuid_lib
 
+import consul
 import hazelcast
-import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="logging-service", version="3.0.0")
+app = FastAPI(title="logging-service", version="4.0.0")
 
-HZ_CLUSTER_MEMBERS = os.getenv(
-    "HZ_CLUSTER_MEMBERS",
-    "hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701",
-)
-CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://config-server:8010")
-SELF_URL = os.getenv("SELF_URL", "http://logging-service:8001")
+CONSUL_HOST = os.getenv("CONSUL_HOST", "consul")
+CONSUL_PORT = int(os.getenv("CONSUL_PORT", "8500"))
+SERVICE_ID = os.getenv("SERVICE_ID", "logging-service-1")
+SERVICE_NAME = "logging-service"
+SERVICE_ADDRESS = os.getenv("SERVICE_ADDRESS", "logging-service-1")
+SERVICE_PORT = int(os.getenv("SERVICE_PORT", "8001"))
 MAP_NAME = "messages"
 
+consul_client: consul.Consul = None
 hz_client: hazelcast.HazelcastClient = None
 store = None
 
 
+def _kv_get(key: str, default: str = "") -> str:
+    for attempt in range(10):
+        try:
+            _, data = consul_client.kv.get(key)
+            if data and data.get("Value"):
+                return data["Value"].decode()
+        except Exception as e:
+            print(f"[CONSUL] KV '{key}' attempt {attempt + 1}: {e}")
+        time.sleep(2)
+    print(f"[CONSUL] KV '{key}' not found, using default: '{default}'")
+    return default
+
+
 @app.on_event("startup")
 def startup():
-    global hz_client, store
-    members = HZ_CLUSTER_MEMBERS.split(",")
+    global consul_client, hz_client, store
+
+    consul_client = consul.Consul(host=CONSUL_HOST, port=CONSUL_PORT)
+
+    hz_members_str = _kv_get(
+        "hazelcast/cluster-members",
+        "hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701",
+    )
+    print(f"[CONSUL] HZ members: {hz_members_str}")
+
+    members = hz_members_str.split(",")
     hz_client = hazelcast.HazelcastClient(
         cluster_members=members,
         cluster_name="dev",
@@ -41,22 +64,31 @@ def startup():
     store = hz_client.get_map(MAP_NAME).blocking()
     print(f"[HZ] Connected to cluster members: {members}")
 
-    for attempt in range(10):
-        try:
-            with httpx.Client(timeout=5.0) as client:
-                client.post(
-                    f"{CONFIG_SERVER_URL}/register",
-                    json={"name": "logging-service", "url": SELF_URL},
-                )
-            print(f"[CONFIG] Registered logging-service -> {SELF_URL}")
-            break
-        except Exception as e:
-            print(f"[CONFIG] Registration attempt {attempt + 1} failed: {e}")
-            time.sleep(2)
+    try:
+        consul_client.agent.service.register(
+            name=SERVICE_NAME,
+            service_id=SERVICE_ID,
+            address=SERVICE_ADDRESS,
+            port=SERVICE_PORT,
+            check=consul.Check.http(
+                f"http://{SERVICE_ADDRESS}:{SERVICE_PORT}/health",
+                interval="10s",
+                timeout="5s",
+                deregister="30s",
+            ),
+        )
+        print(f"[CONSUL] Registered {SERVICE_ID} @ {SERVICE_ADDRESS}:{SERVICE_PORT}")
+    except Exception as e:
+        print(f"[CONSUL] Registration failed: {e}")
 
 
 @app.on_event("shutdown")
 def shutdown():
+    try:
+        consul_client.agent.service.deregister(SERVICE_ID)
+        print(f"[CONSUL] Deregistered {SERVICE_ID}")
+    except Exception:
+        pass
     if hz_client:
         hz_client.shutdown()
 
@@ -87,7 +119,7 @@ def add_log(payload: LogIn):
     try:
         existing = store.get(payload.id)
         if existing is not None:
-            print(f"[DEDUP] duplicate id={payload.id} msg='{payload.msg}'")
+            print(f"[DEDUP] duplicate id={payload.id}")
             return LogOut(id=payload.id, stored=False, msg=existing)
         store.put(payload.id, payload.msg)
         print(f"[STORE] id={payload.id} msg='{payload.msg}'")

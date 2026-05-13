@@ -2,11 +2,26 @@ version: "3.9"
 
 services:
 
-  config-server:
-    build: ./config-server
-    container_name: config-server
+  consul:
+    image: hashicorp/consul:1.17
+    container_name: consul
+    command: agent -server -bootstrap-expect=1 -ui -client=0.0.0.0
     ports:
-      - "8010:8010"
+      - "8500:8500"
+      - "8600:8600/udp"
+    healthcheck:
+      test: ["CMD", "consul", "members"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  consul-init:
+    build: ./consul-init
+    container_name: consul-init
+    depends_on:
+      consul:
+        condition: service_healthy
+    restart: "no"
 
   hazelcast-1:
     image: hazelcast/hazelcast:5.3
@@ -15,6 +30,9 @@ services:
       - HZ_CLUSTERNAME=dev
     ports:
       - "5701:5701"
+    depends_on:
+      consul:
+        condition: service_healthy
 
   hazelcast-2:
     image: hazelcast/hazelcast:5.3
@@ -23,6 +41,9 @@ services:
       - HZ_CLUSTERNAME=dev
     ports:
       - "5702:5701"
+    depends_on:
+      consul:
+        condition: service_healthy
 
   hazelcast-3:
     image: hazelcast/hazelcast:5.3
@@ -31,6 +52,9 @@ services:
       - HZ_CLUSTERNAME=dev
     ports:
       - "5703:5701"
+    depends_on:
+      consul:
+        condition: service_healthy
 
   mysql:
     image: mysql:8.0
@@ -50,46 +74,61 @@ services:
     build: ./logging-service
     container_name: logging-service-1
     environment:
-      - HZ_CLUSTER_MEMBERS=hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
-      - CONFIG_SERVER_URL=http://config-server:8010
-      - SELF_URL=http://logging-service-1:8001
+      - CONSUL_HOST=consul
+      - SERVICE_ID=logging-service-1
+      - SERVICE_ADDRESS=logging-service-1
+      - SERVICE_PORT=8001
     ports:
       - "8001:8001"
     depends_on:
-      - config-server
-      - hazelcast-1
-      - hazelcast-2
-      - hazelcast-3
+      consul-init:
+        condition: service_completed_successfully
+      hazelcast-1:
+        condition: service_started
+      hazelcast-2:
+        condition: service_started
+      hazelcast-3:
+        condition: service_started
 
   logging-service-2:
     build: ./logging-service
     container_name: logging-service-2
     environment:
-      - HZ_CLUSTER_MEMBERS=hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
-      - CONFIG_SERVER_URL=http://config-server:8010
-      - SELF_URL=http://logging-service-2:8001
+      - CONSUL_HOST=consul
+      - SERVICE_ID=logging-service-2
+      - SERVICE_ADDRESS=logging-service-2
+      - SERVICE_PORT=8001
     ports:
       - "8011:8001"
     depends_on:
-      - config-server
-      - hazelcast-1
-      - hazelcast-2
-      - hazelcast-3
+      consul-init:
+        condition: service_completed_successfully
+      hazelcast-1:
+        condition: service_started
+      hazelcast-2:
+        condition: service_started
+      hazelcast-3:
+        condition: service_started
 
   logging-service-3:
     build: ./logging-service
     container_name: logging-service-3
     environment:
-      - HZ_CLUSTER_MEMBERS=hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
-      - CONFIG_SERVER_URL=http://config-server:8010
-      - SELF_URL=http://logging-service-3:8001
+      - CONSUL_HOST=consul
+      - SERVICE_ID=logging-service-3
+      - SERVICE_ADDRESS=logging-service-3
+      - SERVICE_PORT=8001
     ports:
       - "8021:8001"
     depends_on:
-      - config-server
-      - hazelcast-1
-      - hazelcast-2
-      - hazelcast-3
+      consul-init:
+        condition: service_completed_successfully
+      hazelcast-1:
+        condition: service_started
+      hazelcast-2:
+        condition: service_started
+      hazelcast-3:
+        condition: service_started
 
   counter-service:
     build: ./counter-service
@@ -100,16 +139,17 @@ services:
       - DB_USER=root
       - DB_PASS=root
       - DB_NAME=counterdb
-      - HZ_CLUSTER_MEMBERS=hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
-      - CONFIG_SERVER_URL=http://config-server:8010
-      - SELF_URL=http://counter-service:8002
+      - CONSUL_HOST=consul
+      - SERVICE_ID=counter-service-1
+      - SERVICE_ADDRESS=counter-service
+      - SERVICE_PORT=8002
     ports:
       - "8002:8002"
     depends_on:
       mysql:
         condition: service_healthy
-      config-server:
-        condition: service_started
+      consul-init:
+        condition: service_completed_successfully
       hazelcast-1:
         condition: service_started
       hazelcast-2:
@@ -121,18 +161,27 @@ services:
     build: ./facade-service
     container_name: facade-service
     environment:
-      - HZ_CLUSTER_MEMBERS=hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
-      - CONFIG_SERVER_URL=http://config-server:8010
-      - SELF_URL=http://facade-service:8000
+      - CONSUL_HOST=consul
+      - SERVICE_ID=facade-service-1
+      - SERVICE_ADDRESS=facade-service
+      - SERVICE_PORT=8000
       - TIMEOUT_SEC=2.0
     ports:
       - "8000:8000"
     depends_on:
-      - config-server
-      - logging-service-1
-      - logging-service-2
-      - logging-service-3
-      - counter-service
-      - hazelcast-1
-      - hazelcast-2
-      - hazelcast-3
+      consul-init:
+        condition: service_completed_successfully
+      logging-service-1:
+        condition: service_started
+      logging-service-2:
+        condition: service_started
+      logging-service-3:
+        condition: service_started
+      counter-service:
+        condition: service_started
+      hazelcast-1:
+        condition: service_started
+      hazelcast-2:
+        condition: service_started
+      hazelcast-3:
+        condition: service_started

@@ -2,3 +2,4 @@ fastapi==0.115.6
 uvicorn[standard]==0.30.6
 httpx==0.27.2
 hazelcast-python-client
+python-consul2
